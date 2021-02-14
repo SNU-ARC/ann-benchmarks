@@ -16,10 +16,12 @@ from ann_benchmarks.algorithms.definitions import (Definition,
 from ann_benchmarks.datasets import get_dataset, DATASETS
 from ann_benchmarks.distance import metrics, dataset_transform
 from ann_benchmarks.results import store_results
+from ann_benchmarks.split_and_run import get_queries, get_searcher_path, read_data
 
-
-def run_individual_query(algo, X_train, X_test, distance, count, run_count,
-                         batch):
+# def run_individual_query(algo, X_train, X_test, distance, count, run_count,
+#                          batch):
+def run_individual_query(algo, X_test, distance, count, run_count,
+                         batch, dataset_basedir=None, split_dataset_path=None, num_split=-1, dataset=None):
     prepared_queries = \
         (batch and hasattr(algo, "prepare_batch_query")) or \
         ((not batch) and hasattr(algo, "prepare_query"))
@@ -30,47 +32,74 @@ def run_individual_query(algo, X_train, X_test, distance, count, run_count,
         # a bit dumb but can't be a scalar since of Python's scoping rules
         n_items_processed = [0]
 
-        def single_query(v):
-            if prepared_queries:
-                algo.prepare_query(v, count)
-                start = time.time()
-                algo.run_prepared_query()
-                total = (time.time() - start)
-                candidates = algo.get_prepared_query_results()
-            else:
-                start = time.time()
-                candidates = algo.query(v, count)
-                total = (time.time() - start)
-            candidates = [(int(idx), float(metrics[distance]['distance'](v, X_train[idx])))  # noqa
-                          for idx in candidates]
-            n_items_processed[0] += 1
-            if n_items_processed[0] % 1000 == 0:
-                print('Processed %d/%d queries...' % (n_items_processed[0], len(X_test)))
-            if len(candidates) > count:
-                print('warning: algorithm %s returned %d results, but count'
-                      ' is only %d)' % (algo, len(candidates), count))
-            return (total, candidates)
+        base_idx = 0
+        # results=np.empty((X_test.shape[0], 1, 0))
+        results = None
+        for split in range(num_split):
+            searcher_dir, searcher_path = get_searcher_path(dataset_basedir, str(algo), dataset, distance, num_split, split)      
+            print("Split ", split)
+            # Load splitted dataset
+            X_train = read_data(dataset, split_dataset_path + str(num_split) + "_" + str(split) if num_split>1 else dataset_basedir, base=False if num_split>1 else True, offset_=None if num_split>1 else 0, shape_=None)
+            X_train = dataset_transform[distance](X_train)
+            # Create/Load searcher
 
-        def batch_query(X):
-            if prepared_queries:
-                algo.prepare_batch_query(X, count)
-                start = time.time()
-                algo.run_batch_query()
-                total = (time.time() - start)
-            else:
-                start = time.time()
-                algo.batch_query(X, count)
-                total = (time.time() - start)
-            results = algo.get_batch_results()
-            candidates = [[(int(idx), float(metrics[distance]['distance'](v, X_train[idx])))  # noqa
-                           for idx in single_results]
-                          for v, single_results in zip(X, results)]
-            return [(total / float(len(X)), v) for v in candidates]
+            t0 = time.time()
+            memory_usage_before = algo.get_memory_usage()
+            algo.fit(X_train, searcher_path)
+            build_time = time.time() - t0
+            index_size = algo.get_memory_usage() - memory_usage_before
+            print('Built index in', build_time)
+            print('Index size: ', index_size)
 
-        if batch:
-            results = batch_query(X_test)
-        else:
-            results = [single_query(x) for x in X_test]
+            def single_query(v, base_idx=0):
+                if prepared_queries:
+                    algo.prepare_query(v, count)
+                    start = time.time()
+                    algo.run_prepared_query()
+                    total = (time.time() - start)
+                    candidates = algo.get_prepared_query_results()
+                else:
+                    start = time.time()
+                    candidates = algo.query(v, count)
+                    total = (time.time() - start)
+                candidates = [(int(idx)+base_idx, float(metrics[distance]['distance'](v, X_train[idx])))  # noqa
+                              for idx in candidates]
+                n_items_processed[0] += 1
+                if n_items_processed[0] % 1000 == 0:
+                    print('Processed %d/%d queries...' % (n_items_processed[0], len(X_test)))
+                if len(candidates) > count:
+                    print('warning: algorithm %s returned %d results, but count'
+                          ' is only %d)' % (algo, len(candidates), count))
+                return (total, candidates)
+
+            def batch_query(X, base_idx=0):
+                if prepared_queries:
+                    algo.prepare_batch_query(X, count)
+                    start = time.time()
+                    algo.run_batch_query()
+                    total = (time.time() - start)
+                else:
+                    start = time.time()
+                    algo.batch_query(X, count)
+                    total = (time.time() - start)
+                results = algo.get_batch_results()
+                candidates = [[(int(idx)+base_idx, float(metrics[distance]['distance'](v, X_train[idx])))  # noqa
+                               for idx in single_results]
+                              for v, single_results in zip(X, results)]
+                return [(total / float(len(X)), v) for v in candidates]
+
+            if batch:
+                local_results = batch_query(X_test, base_idx)
+            else:
+                local_results = [single_query(x, base_idx) for x in X_test]
+
+            if results==None:
+                results = local_results
+            else:
+                results = [(a+c, b.append(d)) for (a,b),(c,d) in zip(results, local_results)]
+
+            # results = np.append(results, local_results, axis=2)
+            base_idx = base_idx + X_train.shape[0]
 
         total_time = sum(time for time, _ in results)
         total_candidates = sum(len(candidates) for _, candidates in results)
@@ -95,7 +124,7 @@ def run_individual_query(algo, X_train, X_test, distance, count, run_count,
     return (attrs, results)
 
 
-def run(definition, dataset, count, run_count, batch):
+def run(definition, dataset, count, run_count, batch, num_split, distance):
     algo = instantiate_algorithm(definition)
     assert not definition.query_argument_groups \
            or hasattr(algo, "set_query_arguments"), """\
@@ -103,28 +132,74 @@ error: query argument groups have been specified for %s.%s(%s), but the \
 algorithm instantiated from it does not implement the set_query_arguments \
 function""" % (definition.module, definition.constructor, definition.arguments)
 
-    D = get_dataset(dataset)
-    X_train = numpy.array(D['train'])
-    X_test = numpy.array(D['test'])
-    distance = D.attrs['distance']
-    print('got a train set of size (%d * %d)' % X_train.shape)
-    print('got %d queries' % len(X_test))
+    # [YJ]
+    assert run_count == 1
 
-    X_train = dataset_transform[distance](X_train)
+    if os.path.isdir("/arc-share"):
+        basedir = "/arc-share/MICRO21_ANNA/"
+    else:
+        basedir = "./"
+
+    split_dataset_path = None
+    index_key = None
+    N = -1
+    D = -1
+    num_iter = -1
+    qN = -1
+    if "sift1m" in dataset:
+        dataset_basedir = basedir + "SIFT1M/"
+        split_dataset_path = dataset_basedir+"split_data/sift1m_"
+        # groundtruth_path = dataset_basedir + "sift1m_"+args.metric+"_gt"
+        N=1000000
+        D=128
+        num_iter = 1
+        qN = 10000
+        index_key = "IVF4096,PQ64"
+    elif "sift1b" in dataset:
+        dataset_basedir = basedir + "SIFT1B/"
+        split_dataset_path = dataset_basedir+"split_data/sift1b_"
+        # groundtruth_path = dataset_basedir + "sift1b_"+args.metric+"_gt"
+        N=1000000000
+        D=128
+        num_iter = 4
+        qN = 10000
+        index_key = "OPQ8_32,IVF262144,PQ8"
+    elif "glove" in dataset:
+        dataset_basedir = basedir + "GLOVE/"
+        split_dataset_path = dataset_basedir+"split_data/glove_"
+        # groundtruth_path = dataset_basedir + "glove_"+args.metric+"_gt"
+        N=1183514
+        D=100
+        num_iter = 10
+        qN = 10000
+
+
+
+    # D = get_dataset(dataset)
+    # X_train = numpy.array(D['train'])
+    # X_test = numpy.array(D['test'])
+    # distance = D.attrs['distance']
+    # print('got a train set of size (%d * %d)' % X_train.shape)
+    # print('got %d queries' % len(X_test))
+
+    X_test = get_queries(dataset, dataset_basedir)
+
+    # X_train = dataset_transform[distance](X_train)
     X_test = dataset_transform[distance](X_test)
 
+                              
     try:
         prepared_queries = False
         if hasattr(algo, "supports_prepared_queries"):
             prepared_queries = algo.supports_prepared_queries()
 
-        t0 = time.time()
-        memory_usage_before = algo.get_memory_usage()
-        algo.fit(X_train)
-        build_time = time.time() - t0
-        index_size = algo.get_memory_usage() - memory_usage_before
-        print('Built index in', build_time)
-        print('Index size: ', index_size)
+        # t0 = time.time()
+        # memory_usage_before = algo.get_memory_usage()
+        # algo.fit(X_train)
+        # build_time = time.time() - t0
+        # index_size = algo.get_memory_usage() - memory_usage_before
+        # print('Built index in', build_time)
+        # print('Index size: ', index_size)
 
         query_argument_groups = definition.query_argument_groups
         # Make sure that algorithms with no query argument groups still get run
@@ -137,8 +212,12 @@ function""" % (definition.module, definition.constructor, definition.arguments)
                   (pos, len(query_argument_groups)))
             if query_arguments:
                 algo.set_query_arguments(*query_arguments)
-            descriptor, results = run_individual_query(
-                algo, X_train, X_test, distance, count, run_count, batch)
+
+
+            # descriptor, results = run_individual_query(
+            #     algo, X_train, X_test, distance, count, run_count, batch)
+            descriptor, results = run_individual_query(algo, X_test, distance, count, run_count, batch, dataset_basedir, split_dataset_path, num_split, dataset)
+
             descriptor["build_time"] = build_time
             descriptor["index_size"] = index_size
             descriptor["algo"] = definition.algorithm

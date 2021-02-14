@@ -13,7 +13,7 @@ class BaseANN(object):
         # return in kB for backwards compatibility
         return psutil.Process().memory_info().rss / 1024
 
-    def fit(self, X):
+    def fit(self, X, searcher_path=None):
         pass
 
     def query(self, q, n):
