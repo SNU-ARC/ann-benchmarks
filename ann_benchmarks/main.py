@@ -37,7 +37,7 @@ def run_worker(cpu, args, queue):
     while not queue.empty():
         definition = queue.get()
         if args.local:
-            run(definition, args.dataset, args.count, args.runs, args.batch, args.num_split, args.metric)
+            run(definition, args.dataset, args.count, args.runs, args.batch)
         else:
             memory_margin = 500e6  # reserve some extra memory for misc stuff
             mem_limit = int((psutil.virtual_memory().available - memory_margin) / args.parallelism)
@@ -123,18 +123,6 @@ def main():
         help='Number of Docker containers in parallel',
         default=1)
 
-    # ANNA
-    parser.add_argument(
-        '--num_split',
-        type=positive_int,
-        help='Number of split',
-        default=1)
-    parser.add_argument(
-        '--metric',
-        type=str,
-        help='dot_product, squared_l2',
-        default=1)
-
     args = parser.parse_args()
     if args.timeout == -1:
         args.timeout = None
@@ -154,7 +142,6 @@ def main():
     dataset = get_dataset(args.dataset)
     dimension = len(dataset['train'][0])  # TODO(erikbern): ugly
     point_type = dataset.attrs.get('point_type', 'float')
-    print("pointtype: ", point_type)
     distance = dataset.attrs['distance']
     definitions = get_definitions(
         args.definitions, dimension, point_type, distance, args.count)
